@@ -6,6 +6,7 @@ import re
 import sys
 
 from sqlparse3 import tokens as T
+from sqlparse3.compat import string_types, u
 
 
 class Token(object):
@@ -32,7 +33,7 @@ class Token(object):
         if sys.version_info[0] == 3:
             return self.value
         else:
-            return str(self).encode('utf-8')
+            return u(self).encode('utf-8')
 
     def __repr__(self):
         short = self._get_repr_value()
@@ -45,21 +46,13 @@ class Token(object):
         """Returns a unicode representation of this object."""
         return self.value or ''
 
-    def to_unicode(self):
-        """Returns a unicode representation of this object.
-
-        .. deprecated:: 0.1.5
-           Use ``unicode(token)`` (for Python 3: ``str(token)``) instead.
-        """
-        return str(self)
-
     def _get_repr_name(self):
         return str(self.ttype).split('.')[-1]
 
     def _get_repr_value(self):
-        raw = str(self)
+        raw = u(self)
         if len(raw) > 7:
-            raw = raw[:6] + '...'
+            raw = raw[:6] + u'...'
         return re.sub('\s+', ' ', raw)
 
     def flatten(self):
@@ -83,7 +76,7 @@ class Token(object):
             return type_matched
 
         if regex:
-            if isinstance(values, str):
+            if isinstance(values, string_types):
                 values = set([values])
 
             if self.ttype is T.Keyword:
@@ -96,7 +89,7 @@ class Token(object):
                     return True
             return False
 
-        if isinstance(values, str):
+        if isinstance(values, string_types):
             if self.is_keyword:
                 return values.upper() == self.normalized
             return values == self.value
@@ -164,7 +157,7 @@ class TokenList(Token):
 
     def __str__(self):
         str_ = self._to_string()
-        if sys.version_info[0] < 2:
+        if sys.version_info[0] <= 2:
             str_ = str_.encode('utf-8')
         return str_
 
@@ -172,7 +165,7 @@ class TokenList(Token):
         if sys.version_info[0] == 3:
             return ''.join(x.value for x in self.flatten())
         else:
-            return ''.join(str(x) for x in self.flatten())
+            return ''.join(u(x) for x in self.flatten())
 
     def _get_repr_name(self):
         return self.__class__.__name__
@@ -231,7 +224,6 @@ class TokenList(Token):
         return True
 
     def get_sublists(self):
-#        return [x for x in self.tokens if isinstance(x, TokenList)]
         for x in self.tokens:
             if isinstance(x, TokenList):
                 yield x
@@ -240,18 +232,23 @@ class TokenList(Token):
     def _groupable_tokens(self):
         return self.tokens
 
-    def token_first(self, ignore_whitespace=True):
+    def token_first(self, ignore_whitespace=True, ignore_comments=False):
         """Returns the first child token.
 
         If *ignore_whitespace* is ``True`` (the default), whitespace
         tokens are ignored.
+
+        if *ignore_comments* is ``True`` (default: ``False``), comments are
+        ignored too.
         """
         for token in self.tokens:
             if ignore_whitespace and token.is_whitespace():
                 continue
+            if ignore_comments and isinstance(token, Comment):
+                continue
             return token
 
-    def token_next_by_instance(self, idx, clss):
+    def token_next_by_instance(self, idx, clss, end=None):
         """Returns the next token matching a class.
 
         *idx* is where to start searching in the list of child tokens.
@@ -262,7 +259,7 @@ class TokenList(Token):
         if not isinstance(clss, (list, tuple)):
             clss = (clss,)
 
-        for token in self.tokens[idx:]:
+        for token in self.tokens[idx:end]:
             if isinstance(token, clss):
                 return token
 
@@ -338,8 +335,16 @@ class TokenList(Token):
                 continue
             return self.tokens[idx]
 
-    def token_index(self, token):
+    def token_index(self, token, start=0):
         """Return list index of token."""
+        if start > 0:
+            # Performing `index` manually is much faster when starting
+            # in the middle of the list of tokens and expecting to find
+            # the token near to the starting index.
+            for i in range(start, len(self.tokens)):
+                if self.tokens[i] == token:
+                    return i
+            return -1
         return self.tokens.index(token)
 
     def tokens_between(self, start, end, exclude_end=False):
@@ -390,21 +395,18 @@ class TokenList(Token):
 
     def get_alias(self):
         """Returns the alias for this identifier or ``None``."""
+
+        # "name AS alias"
         kw = self.token_next_match(0, T.Keyword, 'AS')
         if kw is not None:
-            alias = self.token_next(self.token_index(kw))
-            if alias is None:
-                return None
-        else:
-            next_ = self.token_next_by_instance(0, Identifier)
-            if next_ is None:
-                next_ = self.token_next_by_type(0, T.String.Symbol)
-                if next_ is None:
-                    return None
-            alias = next_
-        if isinstance(alias, Identifier):
-            return alias.get_name()
-        return self._remove_quotes(str(alias))
+            return self._get_first_name(kw, keywords=True)
+
+        # "name alias" or "complicated column expression alias"
+        if len(self.tokens) > 2 \
+           and self.token_next_by_type(0, T.Whitespace) is not None:
+            return self._get_first_name(reverse=True)
+
+        return None
 
     def get_name(self):
         """Returns the name of this identifier.
@@ -422,17 +424,43 @@ class TokenList(Token):
         """Returns the real name (object name) of this identifier."""
         # a.b
         dot = self.token_next_match(0, T.Punctuation, '.')
-        if dot is None:
-            next_ = self.token_next_by_type(0, T.Name)
-            if next_ is not None:
-                return self._remove_quotes(next_.value)
-            return None
+        if dot is not None:
+            return self._get_first_name(self.token_index(dot))
 
-        next_ = self.token_next_by_type(self.token_index(dot),
-                                        (T.Name, T.Wildcard, T.String.Symbol))
-        if next_ is None:  # invalid identifier, e.g. "a."
+        return self._get_first_name()
+
+    def get_parent_name(self):
+        """Return name of the parent object if any.
+
+        A parent object is identified by the first occuring dot.
+        """
+        dot = self.token_next_match(0, T.Punctuation, '.')
+        if dot is None:
             return None
-        return self._remove_quotes(next_.value)
+        prev_ = self.token_prev(self.token_index(dot))
+        if prev_ is None:  # something must be verry wrong here..
+            return None
+        return self._remove_quotes(prev_.value)
+
+    def _get_first_name(self, idx=None, reverse=False, keywords=False):
+        """Returns the name of the first token with a name"""
+
+        if idx and not isinstance(idx, int):
+            idx = self.token_index(idx) + 1
+
+        tokens = self.tokens[idx:] if idx else self.tokens
+        tokens = reversed(tokens) if reverse else tokens
+        types = [T.Name, T.Wildcard, T.String.Symbol]
+
+        if keywords:
+            types.append(T.Keyword)
+
+        for tok in tokens:
+            if tok.ttype in types:
+                return self._remove_quotes(tok.value)
+            elif isinstance(tok, Identifier) or isinstance(tok, Function):
+                return tok.get_name()
+        return None
 
 
 class Statement(TokenList):
@@ -446,8 +474,11 @@ class Statement(TokenList):
         The returned value is a string holding an upper-cased reprint of
         the first DML or DDL keyword. If the first token in this group
         isn't a DML or DDL keyword "UNKNOWN" is returned.
+
+        Whitespaces and comments at the beginning of the statement
+        are ignored.
         """
-        first_token = self.token_first()
+        first_token = self.token_first(ignore_comments=True)
         if first_token is None:
             # An "empty" statement that either has not tokens at all
             # or only whitespace tokens.
@@ -467,19 +498,6 @@ class Identifier(TokenList):
 
     __slots__ = ('value', 'ttype', 'tokens')
 
-    def get_parent_name(self):
-        """Return name of the parent object if any.
-
-        A parent object is identified by the first occuring dot.
-        """
-        dot = self.token_next_match(0, T.Punctuation, '.')
-        if dot is None:
-            return None
-        prev_ = self.token_prev(self.token_index(dot))
-        if prev_ is None:  # something must be verry wrong here..
-            return None
-        return self._remove_quotes(prev_.value)
-
     def is_wildcard(self):
         """Return ``True`` if this identifier contains a wildcard."""
         token = self.token_next_by_type(0, T.Wildcard)
@@ -493,7 +511,7 @@ class Identifier(TokenList):
         next_ = self.token_next(self.token_index(marker), False)
         if next_ is None:
             return None
-        return str(next_)
+        return u(next_)
 
     def get_ordering(self):
         """Returns the ordering or ``None`` as uppercase string."""
@@ -501,6 +519,14 @@ class Identifier(TokenList):
         if ordering is None:
             return None
         return ordering.value.upper()
+
+    def get_array_indices(self):
+        """Returns an iterator of index token lists"""
+
+        for tok in self.tokens:
+            if isinstance(tok, SquareBrackets):
+                # Use [1:-1] index to discard the square brackets
+                yield tok.tokens[1:-1]
 
 
 class IdentifierList(TokenList):
@@ -520,6 +546,16 @@ class IdentifierList(TokenList):
 
 class Parenthesis(TokenList):
     """Tokens between parenthesis."""
+    __slots__ = ('value', 'ttype', 'tokens')
+
+    @property
+    def _groupable_tokens(self):
+        return self.tokens[1:-1]
+
+
+class SquareBrackets(TokenList):
+    """Tokens between square brackets"""
+
     __slots__ = ('value', 'ttype', 'tokens')
 
     @property
@@ -558,6 +594,9 @@ class Comparison(TokenList):
 class Comment(TokenList):
     """A comment."""
     __slots__ = ('value', 'ttype', 'tokens')
+
+    def is_multiline(self):
+        return self.tokens and self.tokens[0].ttype == T.Comment.Multiline
 
 
 class Where(TokenList):
@@ -626,6 +665,14 @@ class Function(TokenList):
         for t in parenthesis.tokens:
             if isinstance(t, IdentifierList):
                 return t.get_identifiers()
-            elif isinstance(t, Identifier):
-                return [t,]
+            elif (isinstance(t, Identifier) or
+                  isinstance(t, Function) or
+                  t.ttype in T.Literal):
+                return [t, ]
         return []
+
+
+class Begin(TokenList):
+    """A BEGIN/END block."""
+
+    __slots__ = ('value', 'ttype', 'tokens')

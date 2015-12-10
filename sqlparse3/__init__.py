@@ -6,7 +6,7 @@
 """Parse SQL statements."""
 
 
-__version__ = '0.1.10'
+__version__ = '0.2.0.dev0'
 
 
 # Setup namespace
@@ -14,8 +14,7 @@ from sqlparse3 import engine
 from sqlparse3 import filters
 from sqlparse3 import formatter
 
-# Deprecated in 0.1.5. Will be removed in 0.2.0
-from sqlparse3.exceptions import SQLParseError
+from sqlparse3.compat import u
 
 
 def parse(sql, encoding=None):
@@ -67,7 +66,7 @@ def split(sql, encoding=None):
     """
     stack = engine.FilterStack()
     stack.split_statements = True
-    return [str(stmt).strip() for stmt in stack.run(sql, encoding)]
+    return [u(stmt).strip() for stmt in stack.run(sql, encoding)]
 
 
 from sqlparse3.engine.filter import StatementFilter
